@@ -59,7 +59,7 @@ curl -s -X POST http://localhost:8000/api/submissions/preflight \
 pip install -r requirements.txt
 SEED_DEMO=1 TRACE_DB_PATH=./data/traceability.db \
   uvicorn app.main:app --reload --port 8000
-pytest -q        # 运行测试（179 个用例）
+pytest -q        # 运行测试（189 个用例）
 ```
 
 > 所有时间均按 **UTC** 解释，建议使用 `YYYY-MM-DDTHH:MM:SSZ` 格式。
@@ -388,7 +388,7 @@ curl -G "http://localhost:8000/api/coverage/INST-T1" \
 | --- | --- |
 | `start` / `end` | 区段端点（UTC）；点区段二者相等 |
 | `start_inclusive` / `end_inclusive` | 是否包含对应端点；相邻区段在公共端点上恰好一含一不含 |
-| `resolution` | `unique` / `ambiguous` / `broken`，含义与时点报告一致 |
+| `resolution` | `unique` / `ambiguous` / `broken` / `undetermined`，含义与时点报告一致（`undetermined`=枚举截断、结果未定） |
 | `valid` | 代表采样点上唯一成链且无 ERROR |
 | `conflict_codes` | 该区段全部冲突码（去重排序）；合并判定使用冲突码**多重集**（同码出现次数也需一致） |
 | `error_count` / `warning_count` | 代表采样点的 ERROR/WARN 数量 |
@@ -428,8 +428,10 @@ curl -G "http://localhost:8000/api/calibration-slots" \
 
 1. 在**查询起点**判定该仪器是否存在**唯一且校验通过**的溯源链
    （复用 `/api/reports` 同一引擎：`resolution=unique` 且零 ERROR 才放行，
-   多候选链绝不任取一条）。链不可用（无有效证书 / 起点不唯一 / 多候选 /
-   断裂 / 校验失败）时 `slot=null`，`reason_code=TRACEABILITY_CHAIN_UNAVAILABLE`，
+   多候选链绝不任取一条；枚举截断导致**结果未定**（`undetermined`）时
+   同样拒绝）。链不可用（无有效证书 / 起点不唯一 / 多候选 /
+   断裂 / 结果未定 / 校验失败）时 `slot=null`，
+   `reason_code=TRACEABILITY_CHAIN_UNAVAILABLE`，
    `chain_reason_code` 给出细分原因，完整证据见响应内的 `trace_report`；
 2. 预约必须在该**唯一有效链起点证书到期前结束**（`end <= valid_until`），
    搜索窗右端按证书截止裁剪（`search_window_end`），到期前放不下时
@@ -491,7 +493,7 @@ curl -X POST http://localhost:8000/api/calibration-bookings \
 | `detail.code` | 触发条件 |
 | --- | --- |
 | `INSTRUMENT_NOT_FOUND` | 仪器在确认时已不存在 |
-| `TRACEABILITY_CHAIN_UNAVAILABLE` | 预约起点唯一有效链不成立（`detail.reason_code` 细分，附 `trace_report`） |
+| `TRACEABILITY_CHAIN_UNAVAILABLE` | 预约起点唯一有效链不成立（`detail.reason_code` 细分，附 `trace_report`；枚举截断结果未定时细分码为 `RESULT_UNDETERMINED`） |
 | `BOOKING_ENDS_AFTER_CERT_EXPIRY` | 结束晚于起点证书有效期截止（附两者时刻） |
 | `STATION_OCCUPIED` | 单工位该半开区间已有预约（`detail.conflicting_bookings` 给出全部冲突预约） |
 | `STATION_UNDER_MAINTENANCE` | 该半开区间与生效中维护封锁窗口重叠（`detail.conflicting_maintenance_windows` 给出全部冲突窗口） |
@@ -702,7 +704,9 @@ curl -G "http://localhost:8000/api/calibration-bookings/inspection" \
 `invalid` 的 `reason_code` 与确认/改期接口保持一致并更细：
 `INSTRUMENT_NOT_FOUND` / `NO_ACTIVE_CERTIFICATE` /
 `MULTIPLE_ACTIVE_CERTIFICATES` / `MULTIPLE_VALID_CHAINS` /
-`CHAIN_BROKEN` / `ALL_CHAINS_FAILED_CHECKS` / `CHAIN_VALIDATION_FAILED`
+`CHAIN_BROKEN` / `ALL_CHAINS_FAILED_CHECKS` / `CHAIN_VALIDATION_FAILED` /
+`RESULT_UNDETERMINED`（候选链枚举截断、结果未定——既不按样本链放行也
+不误报断裂）
 （以上为链失效）或 `BOOKING_ENDS_AFTER_CERT_EXPIRY`（链有效但截止不足）。
 典型场景：将某条预约的起点证书有效期提前但仍覆盖预约结束，巡检结果为
 `changed`；若提前到预约结束之前则为 `invalid`
@@ -791,21 +795,49 @@ curl -X DELETE http://localhost:8000/api/calibration-maintenance-windows/MW-2026
 {
   "instrument": "W",
   "at": "2026-06-15T00:00:00Z",
-  "resolution": "unique",          // unique=唯一成链 | ambiguous=多候选 | broken=断裂
+  "resolution": "unique",          // unique=唯一成链 | ambiguous=多候选 | broken=断裂 | undetermined=结果未定（枚举截断）
   "valid": true,                   // 唯一成链且无 ERROR 级问题
   "starts": ["CW"],                // 该时点有效的起点证书
-  "active_chain": {                // 叶子→根的有序节点与边
+  "active_chain": {                // 叶子→根的有序节点与边（undetermined 时恒为 null）
     "nodes": [ {"certificate_id": "CW", ...}, {"...":"CR"}, {"...":"CG（国家基准）"} ],
     "edges": [ {"child_cert_id": "CW", "parent_cert_id": "CR", ...} ],
     "reaches_national_standard": true
   },
-  "candidates": [],                // ambiguous 时：>=2 条有效候选链
-  "broken_chains": [],             // 未到基准的部分链（死路/断档/环）
+  "candidates": [],                // ambiguous 时：>=2 条有效候选链；undetermined 时：样本中到基准的候选链（仅供查看，非主链）
+  "broken_chains": [],             // 未到基准的部分链（死路/断档/环）；undetermined 时为样本中的断裂分支
   "conflicts": [ /* 可解释冲突，见下表 */ ],
   "error_count": 0, "warning_count": 0,
-  "statistics": {"paths_enumerated": 1, "root_reaching_chains": 1, ...}
+  "statistics": {"paths_enumerated": 1, "paths_truncated": false, "max_paths": 500,
+                 "root_reaching_chains": 1, ...}
 }
 ```
+
+#### 4.0）枚举上限与“结果未定”（undetermined）
+
+候选链按 DFS 枚举，最多记录 **500 条**（含到基准、死路、断档与成环的各类
+终止）。达到上限后**仍有未展开分支**时，已枚举的路径只是样本，服务按下列
+规则定论，避免把样本误判为唯一或断裂：
+
+- 已见 **≥2 条**到基准且校验通过的合格链 —— 多候选结论不受截断影响，
+  仍判 `ambiguous`（实际候选数可能更多，`TOO_MANY_CANDIDATES` 警告附
+  已枚举样本数）；
+- 已见合格链**不足 2 条**（0 或 1 条）—— 漏检分支中可能存在第 1/2 条
+  合格链，一律判 **`undetermined`（结果未定）**：
+  - `active_chain` 恒为 `null`（**不提供有效主链**）；
+  - 已枚举样本仍在 `candidates`（样本中到基准的链）与 `broken_chains`
+    （样本中未到基准的分支）中给出，`TOO_MANY_CANDIDATES` 给出截断说明；
+  - 冲突中追加 ERROR 级 **`RESULT_UNDETERMINED`**，`detail` 含
+    `max_paths / paths_enumerated / valid_root_chains_in_sample /
+    root_reaching_chains_in_sample / branches_remaining_beyond_limit`，
+    且**不再**给出 `CHAIN_BROKEN` / `ALL_CHAINS_FAILED_CHECKS` 等定论性冲突；
+  - `statistics.paths_truncated=true`。
+- 枚举恰好在 500 条处**穷尽全部分支**（上限外无未展开分支）时
+  `paths_truncated=false`，维持 unique / ambiguous / broken 的正常定论。
+
+`undetermined` 报告**不是断裂也不是唯一**，共同溯源核查、测量相容性评估
+以及全部预约链路门禁（空档查询、确认、批量改期、取消补位、有效性巡检）
+都以专用原因码 **`RESULT_UNDETERMINED`** 拒绝未定结果——不会把漏检的
+合格链误报为断裂，也不会任取一条样本链作为预约/比对依据。
 
 ### 冲突（conflicts）编码
 
@@ -824,6 +856,8 @@ curl -X DELETE http://localhost:8000/api/calibration-maintenance-windows/MW-2026
 | `MULTIPLE_VALID_CHAINS` | ERROR | 多条候选链均到基准且通过校验，链不唯一 |
 | `ALL_CHAINS_FAILED_CHECKS` | ERROR | 有到基准的链但全部未通过校验 |
 | `CHAIN_BROKEN` | ERROR | 全部分支在到基准前终止 |
+| `RESULT_UNDETERMINED` | ERROR | 候选链枚举达到 500 条上限且上限外仍有未展开分支、已见合格链不足 2 条，**结果未定**（保留样本链与截断说明，但不提供有效主链，不判唯一也不判断裂）；共同溯源、测量相容性与预约链路门禁以此码拒绝 |
+| `TOO_MANY_CANDIDATES` | WARN | 候选链枚举达到 500 条上限的截断说明（附已枚举样本数；已见 ≥2 条合格链时多候选仍可定论） |
 | `UNCERTAINTY_NOT_DECAY` | WARN | 父子不确定度相同，未体现逐级放大 |
 | `EDGE_NOT_COVER_CALIBRATION` | WARN | 溯源边区间未覆盖子证书校准时刻 |
 | `ROOT_HAS_PARENT` | WARN | 国家基准证书仍存在向上溯源边 |
@@ -909,6 +943,7 @@ curl -X POST http://localhost:8000/api/assessments/certificate-deactivation \
 | `SIMULATED_ALTERNATIVE_CHAIN_AVAILABLE` | 停用后仍存在唯一有效替代链（附替代链节点） |
 | `SIMULATED_NO_ALTERNATIVE_CHAIN` | 停用后断裂，不存在唯一有效替代链 |
 | `SIMULATED_AMBIGUOUS_AFTER_DEACTIVATION` | 停用后仍为多候选，无唯一替代链 |
+| `SIMULATED_RESULT_UNDETERMINED` | 停用后候选链枚举截断、上限外仍有分支，结果未定，不存在唯一有效替代链（附已枚举样本数） |
 | `SIMULATED_NO_EFFECT` | 停用证书不在该仪器该时点的溯源路径上，状态不变 |
 
 ### 6）批次共同溯源核查（POST /api/assessments/common-traceability）
@@ -1052,6 +1087,7 @@ curl -X POST http://localhost:8000/api/assessments/common-traceability \
 | `CHAIN_BROKEN` | 全部候选分支到基准前终止（死路/断档/环） |
 | `ALL_CHAINS_FAILED_CHECKS` | 有到基准的候选链，但均未通过校验（签名/区间/不确定度） |
 | `CHAIN_VALIDATION_FAILED` | 唯一成链但链上存在 ERROR（如历史证书区间断档） |
+| `RESULT_UNDETERMINED` | 候选链枚举达到 500 条上限且上限外仍有分支、已见合格链不足 2 条，结果未定——不按样本链参与，也不误报为断裂 |
 
 顶层 `reason_code`：参与仪器不足 2 台时为 `INSUFFICIENT_PARTICIPANTS`；
 参与仪器链证书 id 交集为空时为 `NO_COMMON_CERTIFICATE`（此时各参与仪器的
@@ -1168,7 +1204,8 @@ curl -X POST http://localhost:8000/api/assessments/measurement-compatibility \
 不可参与原因码（`nonparticipants[].reason_code`）在共同溯源核查原因码
 （`INSTRUMENT_NOT_FOUND` / `NO_ACTIVE_CERTIFICATE` /
 `MULTIPLE_ACTIVE_CERTIFICATES` / `MULTIPLE_VALID_CHAINS` / `CHAIN_BROKEN` /
-`ALL_CHAINS_FAILED_CHECKS` / `CHAIN_VALIDATION_FAILED`）之外，新增：
+`ALL_CHAINS_FAILED_CHECKS` / `CHAIN_VALIDATION_FAILED` /
+`RESULT_UNDETERMINED`）之外，新增：
 
 | code | 含义 |
 | --- | --- |
@@ -1456,12 +1493,16 @@ curl -G "http://localhost:8000/api/calibration-bookings/inspection" \
 ## 七、溯源算法说明
 
 1. 取目标仪器在 `at` 生效（`valid_from <= at <= valid_until`）的证书作为起点；
-2. 自起点沿在 `at` 有效的边做 DFS 枚举（同父子证书的并行边合并；检测环；500 条上限保护）；
+2. 自起点沿在 `at` 有效的边做 DFS 枚举（同父子证书的并行边合并；检测环；500 条上限保护——达到上限且仍有未展开分支时置 `paths_truncated=true`）；
 3. 终止条件：到达国家基准仪器证书（成链）、无有效边（死路）、父证书失效（断档）、成环；
 4. 对每条链执行节点级（时点有效性、签名摘要）与链级（父区间覆盖校准时刻、
    不确定度单调不收缩、单位一致、边覆盖校准时刻）检查；对链上全部仪器检查历史区间连续性；
 5. 决策：成链且零 ERROR 的路径恰有 1 条 → `unique`；≥2 条 → `ambiguous`；
    0 条 → `broken`。所有 ERROR/WARN 汇总为可解释冲突列表。
+   **枚举截断保护**：达到 500 条上限且上限外仍有分支时，已枚举路径仅为样本——
+   已见 ≥2 条合格链仍判 `ambiguous`；已见合格链不足 2 条判 `undetermined`
+   （结果未定，保留样本链与截断说明、`active_chain=null`，不下唯一/断裂定论，
+   追加 ERROR `RESULT_UNDETERMINED`）；恰好 500 条穷尽分支则正常定论。
 6. 证书停用影响评估：在内存 Catalog 中移除证书及其关联边（不写库），对每台受影响
    仪器分别在停用前/后的 Catalog 上重跑步骤 1~5，比较状态与链指纹，输出迁移、
    被切断链、替代链与 INFO 级模拟说明。
@@ -1572,6 +1613,10 @@ app/
                      撤销 DELETE）/
                      export / admin
 tests/test_trace.py          10 个接口级测试
+tests/test_undetermined.py   10 个枚举截断“结果未定”测试（undetermined 语义、
+                             样本链保留、已见两条合格链仍判多候选、
+                             空档/确认/巡检/补位/共同溯源/相容性门禁以
+                             RESULT_UNDETERMINED 拒绝）
 tests/test_preflight.py      11 个批量提交预检测试
 tests/test_deactivation.py   8 个停用影响评估测试
 tests/test_coverage.py       10 个仪器时间窗覆盖查询测试

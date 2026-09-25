@@ -14,6 +14,13 @@
      沿链不得收缩（逐级放大）、单位一致性；
   4. 全部成链且通过校验的路径唯一 -> ``unique``；>=2 -> ``ambiguous``；
      0 条 -> ``broken``。所有问题以带 code/节点/链下标的冲突列表返回。
+
+  5. **枚举截断保护**：候选路径达到 ``MAX_PATHS``（500）条且上限之外仍有
+     未展开分支时，已枚举路径仅为样本。已见 >=2 条合格链时多候选结论
+     仍成立（``ambiguous``）；已见合格链不足 2 条时一律判
+     ``undetermined``（结果未定）——保留样本链与截断说明，但不提供有效
+     主链，绝不把样本误判为唯一或断裂。共同溯源、测量相容性与预约链路
+     门禁以专用原因码 ``RESULT_UNDETERMINED`` 拒绝未定结果。
 """
 from __future__ import annotations
 
@@ -88,9 +95,20 @@ def _enumerate_paths(cat: Catalog, starts: list[str], at_s: str):
     path = {"cert_ids": [...leaf -> root...], "edge_ids": [...], "reaches_root",
             "cycle", "issues": [...路径级冲突...]}
     终止节点的问题记录在该 path 的 issues 中。
+
+    枚举最多记录 ``MAX_PATHS`` 条（含到基准、死路、断档与成环的各类终止）。
+    达到上限后仍有未展开的分支时 ``truncated=True``——调用方不得再把已
+    枚举的样本当作“全部候选”给出唯一或断裂的定论。
     """
     paths: list[dict[str, Any]] = []
     truncated = False
+
+    def cap_reached() -> bool:
+        # 统一在上限处收口：包括同一 DFS 帧内循环边产生的终止记录，
+        # 避免“帧入口检查通过后在 for 循环中连续 record”越过上限。
+        if len(paths) >= MAX_PATHS:
+            return True
+        return False
 
     def active_parents(cid: str) -> list[sqlite3.Row]:
         # 同一父证书的并行边视为同一“仪器级”溯源步，取 id 最小的边，保持确定性
@@ -115,7 +133,7 @@ def _enumerate_paths(cat: Catalog, starts: list[str], at_s: str):
 
     def dfs(cert_ids, edge_ids, visited):
         nonlocal truncated
-        if len(paths) >= MAX_PATHS:
+        if cap_reached():
             truncated = True
             return
         current = cert_ids[-1]
@@ -145,6 +163,11 @@ def _enumerate_paths(cat: Catalog, starts: list[str], at_s: str):
             return
 
         for edge in parents:
+            # 同一帧内每条父边都可能产生一条终止记录（成环/父证书失效），
+            # 故必须在每条边处理前复核上限，确保截断时余下分支不再记录。
+            if cap_reached():
+                truncated = True
+                return
             pid = edge["parent_cert_id"]
             if pid in visited:
                 issues = [
@@ -188,6 +211,9 @@ def _enumerate_paths(cat: Catalog, starts: list[str], at_s: str):
             dfs(cert_ids + [pid], edge_ids + [edge["id"]], visited | {pid})
 
     for start in starts:
+        if cap_reached():
+            truncated = True
+            break
         dfs([start], [], {start})
 
     # 完全相同的节点序列去重
@@ -472,8 +498,13 @@ def _build_report(
             _conflict(
                 "TOO_MANY_CANDIDATES",
                 "WARN",
-                f"候选链数量超过枚举上限 {MAX_PATHS}，结果可能不完整",
+                f"候选链数量达到枚举上限 {MAX_PATHS}，上限之外仍有未展开分支，"
+                "已枚举结果仅为样本，不代表全部候选",
                 instrument=instrument_code,
+                detail={
+                    "max_paths": MAX_PATHS,
+                    "paths_enumerated": None,  # 待枚举结束后回填实际样本数
+                },
             )
         )
 
@@ -530,7 +561,12 @@ def _build_report(
     root_paths = [p for p in paths if p["reaches_root"]]
     valid_root = [p for p in root_paths if p["error_count"] == 0]
 
-    # 6) 决策：唯一 / 多候选 / 断裂
+    # 6) 决策：唯一 / 多候选 / 断裂 / 结果未定（枚举截断保护）
+    #
+    # 枚举达到 MAX_PATHS 且上限之外仍有未展开分支时，已枚举的路径只是样本：
+    #   * 已见 >=2 条合格链 —— 多候选结论不受截断影响，仍判 ambiguous；
+    #   * 已见合格链不足 2 条 —— 漏检的分支里可能存在第 1/2 条合格链，
+    #     不得把样本判为唯一或断裂，统一判 undetermined（结果未定）。
     chains = [_serialize_chain(cat, p) for p in paths]
     for p, ch in zip(paths, chains):
         ch["errors"] = p["error_count"]
@@ -540,9 +576,44 @@ def _build_report(
         )
     path_index = {id(p): idx for idx, p in enumerate(paths)}
 
-    if len(valid_root) >= 2:
+    # 回填截断说明中的实际样本数（去重后的 paths 长度）
+    for issue in global_issues:
+        if issue["code"] == "TOO_MANY_CANDIDATES":
+            issue["detail"]["paths_enumerated"] = len(paths)
+
+    active_chain: Optional[dict[str, Any]] = None
+    candidate_chains: list[dict[str, Any]] = []
+    broken_chains: list[dict[str, Any]] = []
+
+    if truncated and len(valid_root) < 2:        # 结果未定：保留已枚举样本（候选链 + 未到基准分支）与截断说明，
+        # 但不提供有效主链，也不下 CHAIN_BROKEN / ALL_CHAINS_FAILED_CHECKS
+        # 等定论性冲突。
+        resolution = "undetermined"
+        candidate_chains = [chains[path_index[id(p)]] for p in root_paths]
+        broken_chains = [
+            chains[path_index[id(p)]] for p in paths if not p["reaches_root"]
+        ]
+        seen_valid = len(valid_root)
+        global_issues.append(
+            _conflict(
+                "RESULT_UNDETERMINED",
+                "ERROR",
+                f"候选链枚举达到上限 {MAX_PATHS} 且仍有未展开分支，"
+                f"已枚举的 {len(paths)} 条样本中仅见 {seen_valid} 条到达国家基准"
+                "且通过校验的合格链（不足 2 条）；漏检分支中可能存在其他合格链，"
+                "溯源结果未定，不得将已枚举样本判为唯一链或断裂",
+                instrument=instrument_code,
+                detail={
+                    "max_paths": MAX_PATHS,
+                    "paths_enumerated": len(paths),
+                    "valid_root_chains_in_sample": seen_valid,
+                    "root_reaching_chains_in_sample": len(root_paths),
+                    "branches_remaining_beyond_limit": True,
+                },
+            )
+        )
+    elif len(valid_root) >= 2:
         resolution = "ambiguous"
-        active_chain = None
         candidate_paths = valid_root
         candidate_chains = [chains[path_index[id(p)]] for p in candidate_paths]
         other_paths = [p for p in paths if p not in candidate_paths]
@@ -559,6 +630,17 @@ def _build_report(
                 },
             )
         )
+        if truncated:
+            # 截断警告已在枚举后统一加入；此处补充“多候选仍可定论”的说明
+            for issue in global_issues:
+                if issue["code"] == "TOO_MANY_CANDIDATES":
+                    issue["message"] = (
+                        f"枚举在 {MAX_PATHS} 条处截断、上限外仍有分支；已枚举样本中"
+                        f"已见 {len(valid_root)} 条合格链，多候选结论成立"
+                        "（实际候选数可能更多）"
+                    )
+                    issue["detail"]["valid_root_chains_in_sample"] = len(valid_root)
+                    break
     elif len(valid_root) == 1:
         resolution = "unique"
         chosen = valid_root[0]
@@ -653,6 +735,8 @@ def _build_report(
             "certificates_total": len(cat.certs),
             "edges_total": len(cat.edges),
             "paths_enumerated": len(paths),
+            "paths_truncated": truncated,
+            "max_paths": MAX_PATHS,
             "root_reaching_chains": len(root_paths),
             "valid_root_chains": len(valid_root),
             "active_chain_depth": (
@@ -672,6 +756,9 @@ REASON_MULTIPLE_VALID_CHAINS = "MULTIPLE_VALID_CHAINS"
 REASON_CHAIN_BROKEN = "CHAIN_BROKEN"
 REASON_ALL_CHAINS_FAILED_CHECKS = "ALL_CHAINS_FAILED_CHECKS"
 REASON_CHAIN_VALIDATION_FAILED = "CHAIN_VALIDATION_FAILED"
+# 候选链枚举截断、上限外仍有分支且已见合格链不足两条：结果未定，
+# 共同溯源/测量相容性/预约链路门禁一律以此码拒绝（既非唯一也非断裂）
+REASON_RESULT_UNDETERMINED = "RESULT_UNDETERMINED"
 REASON_INSUFFICIENT_PARTICIPANTS = "INSUFFICIENT_PARTICIPANTS"
 REASON_NO_COMMON_CERTIFICATE = "NO_COMMON_CERTIFICATE"
 
@@ -770,6 +857,17 @@ def _nonparticipation(
             f"仪器 {code} 在查询时点 {at_s} 存在 "
             f"{report['statistics'].get('valid_root_chains', 0)} 条均到达国家基准且"
             "通过校验的候选链，链不唯一，不得任意选取一条参与共同核查",
+        )
+    if report["resolution"] == "undetermined":
+        stats = report.get("statistics", {})
+        return (
+            REASON_RESULT_UNDETERMINED,
+            f"仪器 {code} 在查询时点 {at_s} 的候选链枚举达到上限 "
+            f"{stats.get('max_paths', MAX_PATHS)} 且上限外仍有未展开分支，"
+            f"已枚举的 {stats.get('paths_enumerated', 0)} 条样本中仅有 "
+            f"{stats.get('valid_root_chains', 0)} 条合格链（不足 2 条），"
+            "溯源结果未定：漏检分支中可能存在其他合格链，"
+            "不得按唯一链放行，也不得误报为断裂",
         )
     if report["resolution"] == "broken":
         if report["statistics"].get("root_reaching_chains", 0) > 0:
@@ -1492,14 +1590,22 @@ def assess_deactivation(
             note_code = {
                 "broken": "SIMULATED_NO_ALTERNATIVE_CHAIN",
                 "ambiguous": "SIMULATED_AMBIGUOUS_AFTER_DEACTIVATION",
+                "undetermined": "SIMULATED_RESULT_UNDETERMINED",
             }.get(after["resolution"])
             if note_code is not None:
+                extra = ""
+                if after["resolution"] == "undetermined":
+                    stats = after.get("statistics", {})
+                    extra = (
+                        "（候选链枚举截断、上限外仍有分支，结果未定，"
+                        f"已枚举 {stats.get('paths_enumerated', 0)} 条样本）"
+                    )
                 notes.append(
                     _conflict(
                         note_code,
                         "INFO",
                         f"停用后该仪器状态为 {after['resolution']}，"
-                        "不存在唯一有效替代链",
+                        "不存在唯一有效替代链" + extra,
                         instrument=code,
                     )
                 )

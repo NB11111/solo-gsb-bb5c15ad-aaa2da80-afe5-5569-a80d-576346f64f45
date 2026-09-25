@@ -436,7 +436,12 @@ class TraceReport(BaseModel):
     instrument: str
     at: datetime
     resolution: str = Field(
-        ..., description="unique | ambiguous | broken（唯一/多候选/断裂）"
+        ...,
+        description=(
+            "unique | ambiguous | broken | undetermined"
+            "（唯一/多候选/断裂/结果未定——枚举达上限且仍有未展开分支、"
+            "已见合格链不足 2 条；未定报告不提供 active_chain）"
+        ),
     )
     valid: bool = Field(..., description="唯一成链且无 ERROR 级问题时为 true")
     starts: List[str]
@@ -491,8 +496,10 @@ class InstrumentDeactivationResult(BaseModel):
         ...,
         description=(
             "状态迁移：unchanged | unique_to_broken | unique_to_ambiguous | "
-            "ambiguous_to_unique | ambiguous_to_broken | broken_to_unique | "
-            "broken_to_ambiguous"
+            "unique_to_undetermined | ambiguous_to_unique | ambiguous_to_broken | "
+            "ambiguous_to_undetermined | broken_to_unique | broken_to_ambiguous | "
+            "broken_to_undetermined | undetermined_to_unique | "
+            "undetermined_to_ambiguous | undetermined_to_broken"
         ),
     )
     before: TraceStateSnapshot = Field(..., description="停用前状态")
@@ -528,7 +535,10 @@ class CoverageSegment(BaseModel):
         ..., description="是否包含终点；与相邻区段在边界点上恰好一含一不含"
     )
     resolution: str = Field(
-        ..., description="unique | ambiguous | broken（与 /api/reports 同义）"
+        ...,
+        description=(
+            "unique | ambiguous | broken | undetermined（与 /api/reports 同义）"
+        ),
     )
     valid: bool = Field(..., description="该区段代表采样点上唯一成链且无 ERROR")
     conflict_codes: List[str] = Field(
@@ -613,7 +623,9 @@ class CommonTraceNonparticipant(BaseModel):
         description=(
             "不可参与原因码：INSTRUMENT_NOT_FOUND | NO_ACTIVE_CERTIFICATE | "
             "MULTIPLE_ACTIVE_CERTIFICATES | MULTIPLE_VALID_CHAINS | "
-            "CHAIN_BROKEN | ALL_CHAINS_FAILED_CHECKS | CHAIN_VALIDATION_FAILED"
+            "CHAIN_BROKEN | ALL_CHAINS_FAILED_CHECKS | CHAIN_VALIDATION_FAILED | "
+            "RESULT_UNDETERMINED（候选链枚举截断、结果未定，"
+            "既不按唯一链放行也不误报为断裂）"
         ),
     )
     reason: str = Field(..., description="中文原因说明")
@@ -759,6 +771,7 @@ class MeasurementNonparticipant(BaseModel):
             "不可参与原因码：INSTRUMENT_NOT_FOUND | NO_ACTIVE_CERTIFICATE | "
             "MULTIPLE_ACTIVE_CERTIFICATES | MULTIPLE_VALID_CHAINS | "
             "CHAIN_BROKEN | ALL_CHAINS_FAILED_CHECKS | CHAIN_VALIDATION_FAILED | "
+            "RESULT_UNDETERMINED（候选链枚举截断、结果未定）| "
             "CERTIFICATE_UNIT_MISMATCH"
         ),
     )
@@ -1033,7 +1046,8 @@ class CalibrationSlotsOut(BaseModel):
         description=(
             "溯源链不可用的细分原因：NO_ACTIVE_CERTIFICATE | "
             "MULTIPLE_ACTIVE_CERTIFICATES | MULTIPLE_VALID_CHAINS | "
-            "CHAIN_BROKEN | ALL_CHAINS_FAILED_CHECKS | CHAIN_VALIDATION_FAILED"
+            "CHAIN_BROKEN | ALL_CHAINS_FAILED_CHECKS | CHAIN_VALIDATION_FAILED | "
+            "RESULT_UNDETERMINED（枚举截断、结果未定，预约链路门禁拒绝）"
         ),
     )
     certificate_id: Optional[str] = Field(
@@ -1089,7 +1103,8 @@ class BookingInspectionItem(BaseModel):
             "invalid：INSTRUMENT_NOT_FOUND | 溯源链细分原因码"
             "（NO_ACTIVE_CERTIFICATE / MULTIPLE_ACTIVE_CERTIFICATES / "
             "MULTIPLE_VALID_CHAINS / CHAIN_BROKEN / ALL_CHAINS_FAILED_CHECKS / "
-            "CHAIN_VALIDATION_FAILED）| BOOKING_ENDS_AFTER_CERT_EXPIRY；"
+            "CHAIN_VALIDATION_FAILED / RESULT_UNDETERMINED）| "
+            "BOOKING_ENDS_AFTER_CERT_EXPIRY；"
             "changed：CERTIFICATE_SNAPSHOT_CHANGED；valid 为 null"
         ),
     )
