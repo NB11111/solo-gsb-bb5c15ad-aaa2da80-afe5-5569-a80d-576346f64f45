@@ -1104,8 +1104,9 @@ def _inspect_booking_row(
     判定规则（与确认/改期写事务共用同一链路门禁与截止比较）：
 
     1. 仪器已不存在，或开始时刻唯一有效链不成立（无有效证书 / 起点不
-       唯一 / 多候选 / 断裂 / 校验失败）-> ``invalid``，原因码取
-       ``INSTRUMENT_NOT_FOUND`` 或链细分原因码；
+       唯一 / 多候选 / 断裂 / 校验失败 / 枚举截断结果未定）-> ``invalid``，
+       原因码取 ``INSTRUMENT_NOT_FOUND`` 或链细分原因码（枚举截断结果未定
+       为 ``TOO_MANY_CANDIDATES``）；
     2. 链仍有效但预约结束晚于**当前**起点证书到期 -> ``invalid``
        （``BOOKING_ENDS_AFTER_CERT_EXPIRY``，半开 ``end == valid_until``
        允许）；

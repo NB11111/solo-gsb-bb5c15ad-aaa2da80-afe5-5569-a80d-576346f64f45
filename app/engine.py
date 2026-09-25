@@ -12,8 +12,12 @@
      无边可走（死路）、父证书在该时点失效（断档）或遇到环；
   3. 对每条链执行：签名摘要重算、父区间是否覆盖子校准时刻、测量不确定度
      沿链不得收缩（逐级放大）、单位一致性；
-  4. 全部成链且通过校验的路径唯一 -> ``unique``；>=2 -> ``ambiguous``；
-     0 条 -> ``broken``。所有问题以带 code/节点/链下标的冲突列表返回。
+  4. 决策：成链且零 ERROR 的路径 >=2 条 -> ``ambiguous``（即使枚举被截断，
+     已见两条合格链足以判定多候选）；枚举未截断时恰 1 条 -> ``unique``、
+     0 条 -> ``broken``；若枚举达到 ``MAX_PATHS`` 上限被截断且已见合格链
+     不足两条，未枚举分支仍可能改变结论，标记 ``indeterminate``（结果未定）——
+     不得将已枚举样本判为唯一或断裂，报告保留样本链与截断说明但不提供
+     有效主链。所有问题以带 code/节点/链下标的冲突列表返回。
 """
 from __future__ import annotations
 
@@ -88,6 +92,10 @@ def _enumerate_paths(cat: Catalog, starts: list[str], at_s: str):
     path = {"cert_ids": [...leaf -> root...], "edge_ids": [...], "reaches_root",
             "cycle", "issues": [...路径级冲突...]}
     终止节点的问题记录在该 path 的 issues 中。
+
+    ``truncated`` 为 True 表示枚举达到 ``MAX_PATHS`` 上限时仍有未探索的
+    分支：此时 ``paths`` 只是按 DFS 顺序先得到的前 ``MAX_PATHS`` 条**样本**，
+    调用方不得据此判定“唯一”或“断裂”（见 ``_build_report`` 的决策）。
     """
     paths: list[dict[str, Any]] = []
     truncated = False
@@ -465,17 +473,9 @@ def _build_report(
             )
         )
 
-    # 2) DFS 枚举全部候选路径
+    # 2) DFS 枚举全部候选路径（达到 MAX_PATHS 上限时截断，truncated=True
+    #    表示上限外仍有未探索分支，paths 仅为先枚举到的样本）
     paths, truncated = _enumerate_paths(cat, starts, at_s)
-    if truncated:
-        global_issues.append(
-            _conflict(
-                "TOO_MANY_CANDIDATES",
-                "WARN",
-                f"候选链数量超过枚举上限 {MAX_PATHS}，结果可能不完整",
-                instrument=instrument_code,
-            )
-        )
 
     # 3) 节点级检查（跨路径去重，节点问题属于经过它的每一条链）
     node_issues: dict[str, list[dict]] = {}
@@ -530,7 +530,14 @@ def _build_report(
     root_paths = [p for p in paths if p["reaches_root"]]
     valid_root = [p for p in root_paths if p["error_count"] == 0]
 
-    # 6) 决策：唯一 / 多候选 / 断裂
+    # 6) 决策：唯一 / 多候选 / 断裂 / 结果未定（枚举截断）
+    #
+    # 枚举被截断（truncated）时 paths 只是样本：
+    # * 已见 >=2 条合格链 —— 未枚举分支不可能把“多候选”翻成“唯一”，
+    #   仍可判 ambiguous（候选清单可能不完整，附 WARN）；
+    # * 已见合格链不足两条 —— 未枚举分支仍可能藏着合格链，判 unique 或
+    #   broken 都可能误报，必须标记 indeterminate（结果未定），保留样本链
+    #   与截断说明但不提供有效主链。
     chains = [_serialize_chain(cat, p) for p in paths]
     for p, ch in zip(paths, chains):
         ch["errors"] = p["error_count"]
@@ -539,6 +546,12 @@ def _build_report(
             + sum(1 for i in p["chain_issues"] if i["severity"] == "WARN")
         )
     path_index = {id(p): idx for idx, p in enumerate(paths)}
+
+    truncation_detail = {
+        "max_paths": MAX_PATHS,
+        "paths_enumerated": len(paths),
+        "valid_root_chains_seen": len(valid_root),
+    }
 
     if len(valid_root) >= 2:
         resolution = "ambiguous"
@@ -557,6 +570,39 @@ def _build_report(
                 detail={
                     "path_indices": [path_index[id(p)] for p in candidate_paths]
                 },
+            )
+        )
+        if truncated:
+            global_issues.append(
+                _conflict(
+                    "TOO_MANY_CANDIDATES",
+                    "WARN",
+                    f"候选链枚举达到上限 {MAX_PATHS} 条，候选清单可能不完整；"
+                    "已枚举样本中已发现至少两条合格链，多候选结论不受影响",
+                    instrument=instrument_code,
+                    detail=truncation_detail,
+                )
+            )
+    elif truncated:
+        resolution = "indeterminate"
+        active_chain = None
+        # 保留已枚举样本：合格链样本（0 或 1 条）入 candidates，其余样本
+        # （到基准但未通过校验的链与未到基准的分支）入 broken_chains；
+        # 不提供有效主链
+        candidate_paths = valid_root
+        candidate_chains = [chains[path_index[id(p)]] for p in candidate_paths]
+        other_paths = [p for p in paths if p not in candidate_paths]
+        broken_chains = [chains[path_index[id(p)]] for p in other_paths]
+        global_issues.append(
+            _conflict(
+                "TOO_MANY_CANDIDATES",
+                "ERROR",
+                f"候选链枚举达到上限 {MAX_PATHS} 条且已枚举样本中到达国家基准"
+                f"且通过校验的链不足两条（已见 {len(valid_root)} 条），"
+                "上限外仍有未探索分支，溯源结果未定：不得将已枚举样本"
+                "判为唯一链或断裂链",
+                instrument=instrument_code,
+                detail=truncation_detail,
             )
         )
     elif len(valid_root) == 1:
@@ -641,6 +687,7 @@ def _build_report(
         "at": at_s,
         "resolution": resolution,
         "valid": resolution == "unique" and error_count == 0,
+        "enumeration_truncated": truncated,
         "starts": starts,
         "active_chain": active_chain,
         "candidates": candidate_chains,
@@ -653,6 +700,8 @@ def _build_report(
             "certificates_total": len(cat.certs),
             "edges_total": len(cat.edges),
             "paths_enumerated": len(paths),
+            "max_paths": MAX_PATHS,
+            "enumeration_truncated": truncated,
             "root_reaching_chains": len(root_paths),
             "valid_root_chains": len(valid_root),
             "active_chain_depth": (
@@ -672,6 +721,7 @@ REASON_MULTIPLE_VALID_CHAINS = "MULTIPLE_VALID_CHAINS"
 REASON_CHAIN_BROKEN = "CHAIN_BROKEN"
 REASON_ALL_CHAINS_FAILED_CHECKS = "ALL_CHAINS_FAILED_CHECKS"
 REASON_CHAIN_VALIDATION_FAILED = "CHAIN_VALIDATION_FAILED"
+REASON_TOO_MANY_CANDIDATES = "TOO_MANY_CANDIDATES"
 REASON_INSUFFICIENT_PARTICIPANTS = "INSUFFICIENT_PARTICIPANTS"
 REASON_NO_COMMON_CERTIFICATE = "NO_COMMON_CERTIFICATE"
 
@@ -750,7 +800,9 @@ def _nonparticipation(
     """判定一台仪器在该时点不可参与共同核查的原因；可参与返回 None。
 
     仅当该仪器在该时点的链路报告为“唯一成链（resolution=unique）且
-    零 ERROR”时才允许参与；多候选链绝不任意选取其中一条。
+    零 ERROR”时才允许参与；多候选链绝不任意选取其中一条；枚举被截断
+    的“结果未定”报告以专用原因码 ``TOO_MANY_CANDIDATES`` 拒绝——
+    已枚举样本既不得判为唯一链参与，也不得误报为断裂。
     """
     if not report["starts"]:
         return (
@@ -770,6 +822,14 @@ def _nonparticipation(
             f"仪器 {code} 在查询时点 {at_s} 存在 "
             f"{report['statistics'].get('valid_root_chains', 0)} 条均到达国家基准且"
             "通过校验的候选链，链不唯一，不得任意选取一条参与共同核查",
+        )
+    if report["resolution"] == "indeterminate":
+        return (
+            REASON_TOO_MANY_CANDIDATES,
+            f"仪器 {code} 在查询时点 {at_s} 的候选链枚举达到上限 "
+            f"{report['statistics'].get('max_paths', MAX_PATHS)} 条，"
+            "且已枚举样本中到达国家基准且通过校验的链不足两条，溯源结论未定："
+            "已枚举样本不得判为唯一链或断裂链，不得据此参与",
         )
     if report["resolution"] == "broken":
         if report["statistics"].get("root_reaching_chains", 0) > 0:
@@ -803,9 +863,11 @@ def unique_chain_gate(
     供校准工位预约等需要确定性溯源保证的业务复用：仅当报告
     ``resolution=unique`` 且零 ERROR（即 ``valid=true``）时放行，
     返回起点证书 id 与其有效期截止 ``valid_until``；其余情况
-    （仪器存在但无有效起点/起点不唯一/多候选/断裂/校验失败）
-    返回 ``(reason_code, reason, report)``，由调用方向用户说明原因。
-    仪器不存在由调用方（KeyError）自行处理为 404。
+    （仪器存在但无有效起点/起点不唯一/多候选/断裂/校验失败/
+    枚举截断结果未定）返回 ``(reason_code, reason, report)``，
+    由调用方向用户说明原因。枚举截断的“结果未定”报告以专用原因码
+    ``TOO_MANY_CANDIDATES`` 拒绝，避免漏检的合格链被误报为断裂或
+    被当作预约依据。仪器不存在由调用方（KeyError）自行处理为 404。
     """
     at_naive = to_utc_naive(at) if at else datetime.utcnow()
     at_s = fmt(at_naive)
@@ -846,9 +908,11 @@ def build_common_trace_report(
 
     复用现有单仪器链路报告（``_build_report``）：仅当仪器在该时点的报告为
     唯一成链且零 ERROR 时，该仪器才以其唯一链参与比较；其余仪器逐台给出
-    不可参与原因（多候选绝不任取一条）。对参与仪器的链证书 id 求交集，
-    按“距离最大值最小 → 距离总和最小 → 证书 ID 字典序末位”选出最近共同
-    证书，并返回各仪器到该证书的证书子链与距离。全程只读，不写入数据。
+    不可参与原因（多候选绝不任取一条；枚举截断的“结果未定”报告以专用
+    原因码 ``TOO_MANY_CANDIDATES`` 拒绝，已枚举样本不得误报为断裂或
+    唯一链）。对参与仪器的链证书 id 求交集，按“距离最大值最小 → 距离
+    总和最小 → 证书 ID 字典序末位”选出最近共同证书，并返回各仪器到该
+    证书的证书子链与距离。全程只读，不写入数据。
     """
     at_naive = to_utc_naive(at) if at else datetime.utcnow()
     at_s = fmt(at_naive)
@@ -1104,7 +1168,8 @@ def build_measurement_compatibility_report(
 
     逐条读数复用现有单仪器链路报告：仅以该时点**唯一且校验通过**
     （resolution=unique 且零 ERROR）的溯源链参与，取其**起点证书**的
-    扩展不确定度作为该读数的 U；链不可用（多候选绝不任取一条）或
+    扩展不确定度作为该读数的 U；链不可用（多候选绝不任取一条；枚举截断
+    的“结果未定”报告以专用原因码 ``TOO_MANY_CANDIDATES`` 拒绝）或
     起点证书单位与目标单位不符的读数逐条给出原因、不参与计算。
     对可参与读数两两计算 En 并判定相容性，再以极大团（而非连通分量）
     给出全部人数 ≥ 2 的极大两两相容分组（可重叠，按仪器编码稳定排序）。
@@ -1331,6 +1396,7 @@ def _snapshot(report: dict[str, Any]) -> dict[str, Any]:
     return {
         "resolution": report["resolution"],
         "valid": report["valid"],
+        "enumeration_truncated": report["enumeration_truncated"],
         "starts": report["starts"],
         "active_chain": report["active_chain"],
         "candidates": report["candidates"],
@@ -1489,20 +1555,32 @@ def assess_deactivation(
                 )
             )
         if impacted and after["active_chain"] is None:
-            note_code = {
-                "broken": "SIMULATED_NO_ALTERNATIVE_CHAIN",
-                "ambiguous": "SIMULATED_AMBIGUOUS_AFTER_DEACTIVATION",
-            }.get(after["resolution"])
-            if note_code is not None:
+            if after["resolution"] == "indeterminate":
                 notes.append(
                     _conflict(
-                        note_code,
+                        "SIMULATED_RESULT_INDETERMINATE",
                         "INFO",
-                        f"停用后该仪器状态为 {after['resolution']}，"
-                        "不存在唯一有效替代链",
+                        f"停用后该仪器候选链枚举达到上限 {MAX_PATHS} 条且"
+                        "已枚举样本中合格链不足两条，溯源结论未定，"
+                        "无法确认唯一有效替代链（已枚举样本不得判为断裂）",
                         instrument=code,
                     )
                 )
+            else:
+                note_code = {
+                    "broken": "SIMULATED_NO_ALTERNATIVE_CHAIN",
+                    "ambiguous": "SIMULATED_AMBIGUOUS_AFTER_DEACTIVATION",
+                }.get(after["resolution"])
+                if note_code is not None:
+                    notes.append(
+                        _conflict(
+                            note_code,
+                            "INFO",
+                            f"停用后该仪器状态为 {after['resolution']}，"
+                            "不存在唯一有效替代链",
+                            instrument=code,
+                        )
+                    )
         if not impacted:
             notes.append(
                 _conflict(
@@ -1721,6 +1799,7 @@ def build_window_report(
         m.pop("_key")
         m["resolution"] = rep["resolution"]
         m["valid"] = rep["valid"]
+        m["enumeration_truncated"] = rep["enumeration_truncated"]
         m["conflict_codes"] = sorted({c["code"] for c in rep["conflicts"]})
         m["error_count"] = rep["error_count"]
         m["warning_count"] = rep["warning_count"]

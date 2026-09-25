@@ -74,8 +74,9 @@ def calibration_slots(
     3. 在**查询起点**要求该仪器存在**唯一且校验通过**的溯源链，预约
        必须在其**起点证书到期前结束**（``end <= valid_until``），
        搜索窗右端据此裁剪；链不可用（无有效证书/起点不唯一/多候选/
-       断裂/校验失败）时 ``slot=null`` 并在 ``reason`` 中说明原因，
-       完整证据见 ``trace_report``；
+       断裂/校验失败/枚举截断结果未定）时 ``slot=null`` 并在 ``reason``
+       中说明原因（``chain_reason_code`` 给出细分原因码，枚举截断结果
+       未定为 ``TOO_MANY_CANDIDATES``），完整证据见 ``trace_report``；
     4. 在裁剪后的搜索窗内按占用段贪心求最早可容纳所需时长的空档。
     """
     try:
@@ -212,7 +213,8 @@ def inspect_calibration_bookings(
     3. 再与预约保存的证书 ID 与到期快照比较：
 
        * 链失效（仪器不存在 / 无有效证书 / 起点不唯一 / 多候选 / 断裂 /
-         校验失败）或截止不足 -> ``invalid``（给出细分原因码）；
+         校验失败 / 枚举截断结果未定）或截止不足 -> ``invalid``
+         （给出细分原因码，枚举截断结果未定为 ``TOO_MANY_CANDIDATES``）；
        * 链仍有效且截止充足，但证书 ID 或到期时刻变化 -> ``changed``
          （``CERTIFICATE_SNAPSHOT_CHANGED``）；
        * 其余 -> ``valid``。

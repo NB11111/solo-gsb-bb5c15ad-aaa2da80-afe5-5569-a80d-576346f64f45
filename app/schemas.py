@@ -436,16 +436,41 @@ class TraceReport(BaseModel):
     instrument: str
     at: datetime
     resolution: str = Field(
-        ..., description="unique | ambiguous | broken（唯一/多候选/断裂）"
+        ...,
+        description=(
+            "unique | ambiguous | broken | indeterminate"
+            "（唯一/多候选/断裂/枚举达上限截断且已见合格链不足两条，结果未定）"
+        ),
     )
     valid: bool = Field(..., description="唯一成链且无 ERROR 级问题时为 true")
+    enumeration_truncated: bool = Field(
+        False,
+        description=(
+            "候选链枚举是否达到上限（500 条）被截断；截断且已枚举样本中"
+            "合格链不足两条时 resolution=indeterminate（结果未定）"
+        ),
+    )
     starts: List[str]
-    active_chain: Optional[Chain] = None
+    active_chain: Optional[Chain] = Field(
+        None,
+        description=(
+            "唯一有效链（叶子→根）；仅 resolution=unique 时提供，"
+            "indeterminate 不提供有效主链"
+        ),
+    )
     candidates: List[Chain] = Field(
-        default_factory=list, description="到达国家基准的候选链（ambiguous 时 >=2）"
+        default_factory=list,
+        description=(
+            "到达国家基准且通过校验的候选链（ambiguous 时 >=2）；"
+            "indeterminate 时为已枚举样本中的合格链（0 或 1 条，样本可能不完整）"
+        ),
     )
     broken_chains: List[Chain] = Field(
-        default_factory=list, description="未能到达国家基准的部分链"
+        default_factory=list,
+        description=(
+            "未到达国家基准或未通过校验的部分链；indeterminate 时为已枚举"
+            "样本中合格链之外的其余分支（样本，可能不完整）"
+        ),
     )
     conflicts: List[Conflict] = Field(default_factory=list)
     error_count: int = 0
@@ -474,6 +499,9 @@ class TraceStateSnapshot(BaseModel):
     """停用前/后任一时刻的完整评估快照（与 TraceReport 同构）。"""
     resolution: str
     valid: bool
+    enumeration_truncated: bool = Field(
+        False, description="该快照评估时候选链枚举是否达到上限被截断"
+    )
     starts: List[str]
     active_chain: Optional[Chain] = None
     candidates: List[Chain] = Field(default_factory=list)
@@ -490,9 +518,9 @@ class InstrumentDeactivationResult(BaseModel):
     transition: str = Field(
         ...,
         description=(
-            "状态迁移：unchanged | unique_to_broken | unique_to_ambiguous | "
-            "ambiguous_to_unique | ambiguous_to_broken | broken_to_unique | "
-            "broken_to_ambiguous"
+            "状态迁移：unchanged | <停用前状态>_to_<停用后状态>，状态取 "
+            "unique | ambiguous | broken | indeterminate（如 unique_to_broken、"
+            "ambiguous_to_unique、unique_to_indeterminate）"
         ),
     )
     before: TraceStateSnapshot = Field(..., description="停用前状态")
@@ -528,9 +556,16 @@ class CoverageSegment(BaseModel):
         ..., description="是否包含终点；与相邻区段在边界点上恰好一含一不含"
     )
     resolution: str = Field(
-        ..., description="unique | ambiguous | broken（与 /api/reports 同义）"
+        ...,
+        description=(
+            "unique | ambiguous | broken | indeterminate（与 /api/reports 同义）"
+        ),
     )
     valid: bool = Field(..., description="该区段代表采样点上唯一成链且无 ERROR")
+    enumeration_truncated: bool = Field(
+        False,
+        description="该区段代表采样点上候选链枚举是否达到上限被截断",
+    )
     conflict_codes: List[str] = Field(
         default_factory=list,
         description="该区段全部冲突码（去重排序）；合并时按冲突码多重集判定",
@@ -613,7 +648,8 @@ class CommonTraceNonparticipant(BaseModel):
         description=(
             "不可参与原因码：INSTRUMENT_NOT_FOUND | NO_ACTIVE_CERTIFICATE | "
             "MULTIPLE_ACTIVE_CERTIFICATES | MULTIPLE_VALID_CHAINS | "
-            "CHAIN_BROKEN | ALL_CHAINS_FAILED_CHECKS | CHAIN_VALIDATION_FAILED"
+            "CHAIN_BROKEN | ALL_CHAINS_FAILED_CHECKS | CHAIN_VALIDATION_FAILED | "
+            "TOO_MANY_CANDIDATES（枚举截断结果未定）"
         ),
     )
     reason: str = Field(..., description="中文原因说明")
@@ -759,7 +795,7 @@ class MeasurementNonparticipant(BaseModel):
             "不可参与原因码：INSTRUMENT_NOT_FOUND | NO_ACTIVE_CERTIFICATE | "
             "MULTIPLE_ACTIVE_CERTIFICATES | MULTIPLE_VALID_CHAINS | "
             "CHAIN_BROKEN | ALL_CHAINS_FAILED_CHECKS | CHAIN_VALIDATION_FAILED | "
-            "CERTIFICATE_UNIT_MISMATCH"
+            "TOO_MANY_CANDIDATES（枚举截断结果未定） | CERTIFICATE_UNIT_MISMATCH"
         ),
     )
     reason: str = Field(..., description="中文原因说明")
@@ -1033,7 +1069,8 @@ class CalibrationSlotsOut(BaseModel):
         description=(
             "溯源链不可用的细分原因：NO_ACTIVE_CERTIFICATE | "
             "MULTIPLE_ACTIVE_CERTIFICATES | MULTIPLE_VALID_CHAINS | "
-            "CHAIN_BROKEN | ALL_CHAINS_FAILED_CHECKS | CHAIN_VALIDATION_FAILED"
+            "CHAIN_BROKEN | ALL_CHAINS_FAILED_CHECKS | CHAIN_VALIDATION_FAILED | "
+            "TOO_MANY_CANDIDATES（枚举截断结果未定）"
         ),
     )
     certificate_id: Optional[str] = Field(
@@ -1089,7 +1126,8 @@ class BookingInspectionItem(BaseModel):
             "invalid：INSTRUMENT_NOT_FOUND | 溯源链细分原因码"
             "（NO_ACTIVE_CERTIFICATE / MULTIPLE_ACTIVE_CERTIFICATES / "
             "MULTIPLE_VALID_CHAINS / CHAIN_BROKEN / ALL_CHAINS_FAILED_CHECKS / "
-            "CHAIN_VALIDATION_FAILED）| BOOKING_ENDS_AFTER_CERT_EXPIRY；"
+            "CHAIN_VALIDATION_FAILED / TOO_MANY_CANDIDATES）| "
+            "BOOKING_ENDS_AFTER_CERT_EXPIRY；"
             "changed：CERTIFICATE_SNAPSHOT_CHANGED；valid 为 null"
         ),
     )
